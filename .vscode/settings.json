@@ -1,0 +1,9 @@
+{
+    "sync-rsync.remote": "sandreim@sandreim-dev.corp.amazon.com:/home/ANT.AMAZON.COM/sandreim/polly/",
+    "sync-rsync.exclude": [
+        ".git",
+        ".vscode",
+        "build",
+        "target"
+    ]
+}

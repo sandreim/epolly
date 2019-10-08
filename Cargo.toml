@@ -1,0 +1,10 @@
+[package]
+name = "epolly"
+version = "0.0.1"
+authors = [ "Andrei Sandu <sandreim@amazon.com>" ]
+
+[dependencies]
+libc = "0.1.12"
+epoll = "4.1.0"
+
+[workspace]
