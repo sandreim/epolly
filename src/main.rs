@@ -14,7 +14,7 @@ use std::rc::{Rc, Weak};
 
 const EVENT_BUFFER_SIZE: usize = 100;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, PartialEq)]
 pub struct EventID(u64);
 
 pub enum Error {
@@ -118,7 +118,10 @@ pub struct EventManager {
     fd: RawFd,
     handlers: HashMap<u64, EventHandlerData>,
     events: Vec<epoll::Event>,
+    auto_id_index: EventID,
 }
+
+const EVENTMANAGER_AUTO_ID_BASE: u64 = 1_337_000_000_000;
 
 impl EventManager {
     pub fn new() -> Result<Self> {
@@ -127,6 +130,7 @@ impl EventManager {
             fd: epoll_raw_fd,
             handlers: HashMap::new(),
             events: vec![epoll::Event::new(epoll::Events::empty(), 0); EVENT_BUFFER_SIZE],
+            auto_id_index: EventID(EVENTMANAGER_AUTO_ID_BASE),
         })
     }
 
@@ -154,7 +158,13 @@ impl EventManager {
         let wrapped_handler: Rc<RefCell<dyn EventHandler>> = wrapped_type.clone();
 
         for info in registration_info {
-            let (fd, event_id, event_type) = info;
+            let (fd, mut event_id, event_type) = info;
+
+            if event_id == EventID(0) {
+                event_id = self.auto_id_index;
+                self.auto_id_index.0 += 1;
+            }
+
             if self.handlers.get(&event_id.0).is_some() {
                 println!("Event ID {} already registered", event_id.0);
                 return Err(Error::AlreadyExists);
