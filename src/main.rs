@@ -3,7 +3,7 @@ extern crate libc;
 #[macro_use]
 extern crate bitflags;
 use epoll::Events;
-use std::cell::RefCell;
+use std::cell::{RefMut, RefCell};
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
@@ -14,12 +14,14 @@ use std::rc::{Rc, Weak};
 
 const EVENT_BUFFER_SIZE: usize = 100;
 
+#[derive(Default, Clone, Copy)]
 pub struct EventID(u64);
 
 pub enum Error {
     EpollCreate,
     Poll,
     AlreadyExists,
+    EventNotFound(EventID),
 }
 
 bitflags! {
@@ -40,11 +42,27 @@ impl std::fmt::Debug for Error {
             EpollCreate => write!(f, "Unable to create epoll fd."),
             Poll => write!(f, "Error during epoll call."),
             AlreadyExists => write!(f, "A handler for the specified event id already exists"),
+            EventNotFound(id) => write!(f, "A handler for the specified event id {} was not found", id.0),
         }
     }
 }
 
 type Result<T> = std::result::Result<T, Error>;
+type EventRegistrationData = (RawFd, EventID, EventType);
+
+struct EventHandlerData {
+    data: EventRegistrationData,
+    handler: Weak<RefCell<dyn EventHandler>>,
+}
+
+impl EventHandlerData {
+    fn new(data: EventRegistrationData, handler: Weak<RefCell<dyn EventHandler>>) -> EventHandlerData {
+        EventHandlerData {
+            data: data,
+            handler: handler,
+        }
+    }
+}
 
 struct RegistrationBuilder {
     fd: RawFd,
@@ -81,24 +99,24 @@ impl RegistrationBuilder {
         self
     }
 
-    pub fn finish(&self) -> (RawFd, EventID, EventType) {
+    pub fn finish(&self) -> EventRegistrationData {
         (self.fd.clone(), EventID(self.id.0), self.event_mask)
     }
 }
 
 pub trait EventHandler {
-    /// called with EventInfo
     fn handle_read(&mut self, _info: EventID) {}
     fn handle_write(&mut self, _info: EventID) {}
     fn handle_close(&mut self, _info: EventID) {}
 
-    /// Supports registering multiple fds. Each one is identified by EventInfo id.
-    fn registration_info(&self) -> Vec<(RawFd, EventID, EventType)>;
+    /// Support registration of multiple fds. For each FD there is an associated ID in the
+    /// EventID structure.
+    fn registration_info(&self) -> Vec<EventRegistrationData>;
 }
 
 pub struct EventManager {
     fd: RawFd,
-    handlers: HashMap<u64, Weak<RefCell<dyn EventHandler>>>,
+    handlers: HashMap<u64, EventHandlerData>,
     events: Vec<epoll::Event>,
 }
 
@@ -110,6 +128,24 @@ impl EventManager {
             handlers: HashMap::new(),
             events: vec![epoll::Event::new(epoll::Events::empty(), 0); EVENT_BUFFER_SIZE],
         })
+    }
+
+    fn event_type_to_epoll_mask(event_types: EventType) -> epoll::Events {
+        let mut epoll_event_mask = epoll::Events::empty();
+
+        if event_types.contains(EventType::READ) {
+            epoll_event_mask |= epoll::Events::EPOLLIN;
+        }
+
+        if event_types.contains(EventType::WRITE) {
+            epoll_event_mask |= epoll::Events::EPOLLOUT;
+        }
+
+        if event_types.contains(EventType::CLOSE) {
+            epoll_event_mask |= epoll::Events::EPOLLHUP;
+        }
+
+        epoll_event_mask
     }
 
     pub fn register<T: EventHandler + 'static>(&mut self, handler: T) -> Result<Rc<RefCell<T>>> {
@@ -124,36 +160,71 @@ impl EventManager {
                 return Err(Error::AlreadyExists);
             };
 
-            let mut epoll_event_mask = epoll::Events::empty();
-
-            if event_type.contains(EventType::READ) {
-                epoll_event_mask |= epoll::Events::EPOLLIN;
-            }
-
-            if event_type.contains(EventType::WRITE) {
-                epoll_event_mask |= epoll::Events::EPOLLOUT;
-            }
-
-            if event_type.contains(EventType::CLOSE) {
-                epoll_event_mask |= epoll::Events::EPOLLHUP;
-            }
-
             epoll::ctl(
                 self.fd,
                 epoll::ControlOptions::EPOLL_CTL_ADD,
                 fd,
-                epoll::Event::new(epoll_event_mask, event_id.0),
+                epoll::Event::new(EventManager::event_type_to_epoll_mask(event_type), event_id.0),
             )
             .map_err(|_| Error::Poll)?;
+
+            let event_handler_data = EventHandlerData::new((fd, event_id, event_type), Rc::downgrade(&wrapped_handler));
+
             self.handlers
-                .insert(event_id.0, Rc::downgrade(&wrapped_handler));
+                .insert(event_id.0, event_handler_data);
         }
 
         Ok(wrapped_type)
     }
 
-    pub fn unregister(&mut self, id: u64) {
-        self.handlers.remove(&id);
+    pub fn update(&mut self, id: EventID, event_types: EventType) -> Result<()> {
+        if let Some(event_handler_data) = self.handlers.get(&id.0) {
+            epoll::ctl(
+                self.fd,
+                epoll::ControlOptions::EPOLL_CTL_MOD,
+                event_handler_data.data.0,
+                epoll::Event::new(EventManager::event_type_to_epoll_mask(event_types), id.0),
+            )
+            .map_err(|_| Error::Poll)?;
+        } else {
+            println!("Event ID {} not found", id.0);
+            return Err(Error::EventNotFound(id));
+        }
+
+        Ok(())
+    }
+
+    pub fn unregister(&mut self, id: EventID) -> Result <()> {
+        match self.handlers.remove(&id.0) {
+            Some(event_handler_data) => {
+                epoll::ctl(
+                    self.fd,
+                    epoll::ControlOptions::EPOLL_CTL_DEL,
+                    event_handler_data.data.0,
+                    epoll::Event::new(epoll::Events::empty(), 0),
+                )
+                .map_err(|_| Error::Poll);
+            },
+            None => {
+                println!("Event id {} not found", id.0);
+                return Err(Error::EventNotFound(id));
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatch_event(&self, event_id: EventID, evset: epoll::Events, mut handler: RefMut<'_, dyn EventHandler>) {
+        if evset.contains(epoll::Events::EPOLLIN) {
+            handler.handle_read(event_id);
+        }
+
+        if evset.contains(epoll::Events::EPOLLOUT) {
+            handler.handle_write(event_id);
+        }
+
+        if evset.contains(epoll::Events::EPOLLHUP) {
+            handler.handle_close(event_id);
+        }
     }
 
     fn process_events(&mut self, event_count: usize) {
@@ -169,24 +240,23 @@ impl EventManager {
                 }
             };
 
-            // Fetch the handler by epoll userdata <-> handler.id()
-            // Will panic if we received an event for an unknown handler.
-            match self.handlers.get_mut(&event_data).unwrap().upgrade() {
-                Some(handler) => {
-                    if evset.contains(epoll::Events::EPOLLIN) {
-                        handler.borrow_mut().handle_read(EventID(event_data));
+            let mut delete_handler = false;
+            if let Some(event_handler_data) = self.handlers.get(&event_data) {
+                if let Some(handler) = event_handler_data.handler.upgrade() {
+                    match handler.try_borrow_mut() {
+                        Ok(handler_ref) => self.dispatch_event(EventID(event_data), evset, handler_ref),
+                        Err(e) => {
+                            println!("Failed to borrow mutable handler: {}", e);
+                            delete_handler = true;
+                        }
                     }
-
-                    if evset.contains(epoll::Events::EPOLLOUT) {
-                        handler.borrow_mut().handle_write(EventID(event_data));
-                    }
-
-                    if evset.contains(epoll::Events::EPOLLHUP) {
-                        handler.borrow_mut().handle_close(EventID(event_data));
-                    }
+                } else {
+                    println!("Cannot upgrade weak handler for event id {}.", event_data);
                 }
-                None => println!("Unable to upgrade handler weak ref"),
             }
+
+            if delete_handler { self.unregister(EventID(event_data)); }
+            
         }
     }
 
@@ -212,6 +282,8 @@ const ECHO_SERVER_ID_BASE: u64 = 1000;
 struct UdpEchoServer {
     sockets: Vec<UdpSocket>,
     read_buf: Vec<u8>,
+    total_rx: usize,
+    total_tx: usize,
 }
 
 impl UdpEchoServer {
@@ -223,22 +295,34 @@ impl UdpEchoServer {
         Ok(UdpEchoServer {
             sockets: sockets,
             read_buf: vec![0; 128],
+            total_rx: 0,
+            total_tx: 0,
         })
     }
 
-    pub fn yahoo(&self) {
-        println!("Yahoo!");
+    pub fn stats(&self) {
+        println!("Rx bytes: {}, Tx bytes: {}", self.total_rx, self.total_tx);
     }
 }
 
 impl EventHandler for UdpEchoServer {
     fn handle_read(&mut self, info: EventID) {
-        let (count, from) = self.sockets[(info.0 - ECHO_SERVER_ID_BASE) as usize]
-            .recv_from(self.read_buf.as_mut())
-            .unwrap();
-        println!("event_info: {}, - received {} from {}", info.0, count, from);
-        self.sockets[(info.0 - ECHO_SERVER_ID_BASE) as usize]
-            .send_to(&self.read_buf[..count], from);
+        match self.sockets[(info.0 - ECHO_SERVER_ID_BASE) as usize]
+            .recv_from(self.read_buf.as_mut()) {
+            Ok((count, from)) => {
+                self.total_rx += count;
+                println!("event_info: {}, - received {} from {}", info.0, count, from);
+                match self.sockets[(info.0 - ECHO_SERVER_ID_BASE) as usize]
+                    .send_to(&self.read_buf[..count], from) {
+                        Ok(tx) => self.total_tx += tx,
+                        Err(e) => println!("Error while doing TX: {}", e)
+                }
+            },
+            Err(e) => println!("Error while doing RX: {}", e)
+        }
+    }
+    fn handle_write(&mut self, info: EventID) {
+        println!("Writeable")
     }
 
     fn registration_info(&self) -> Vec<(RawFd, EventID, EventType)> {
@@ -267,13 +351,14 @@ fn main() {
 
     let wrapped_server = em.register(UdpEchoServer::new(port).unwrap()).unwrap();
     loop {
-        em.run_timed(1000);
-        {
-            // temporarly borrow the server
-            let server = wrapped_server.borrow();
-            server.yahoo();
-
-            // server borrow is dropped so the event manager can borrow it
+        let server = wrapped_server.borrow();
+        server.stats(); 
+        match server.total_rx {
+            1...9 => em.update(EventID(ECHO_SERVER_ID_BASE), EventType::WRITE | EventType::READ).unwrap(),
+            _ => em.update(EventID(ECHO_SERVER_ID_BASE), EventType::READ).unwrap()
         }
+
+        drop(server);        
+        em.run_timed(1000);
     }
 }
