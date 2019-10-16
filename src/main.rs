@@ -9,12 +9,10 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt::Formatter;
 use std::io::{Read, Write};
-use std::mem::{forget, transmute};
-use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::rc::{Rc, Weak};
 // use std::borrow::{Borrow};
-use libc::c_void;
 use std::ops::Deref;
 
 const EVENT_BUFFER_SIZE: usize = 100;
@@ -59,13 +57,12 @@ impl Deref for OwnedFD {
 
 type Result<T> = std::result::Result<T, Error>;
 type EventRegistrationData = (Pollable, EventType);
-type SharedEventManager = Rc<RefCell<EventManager>>;
 
 /// EventManager can run PollableOp
 pub enum PollableOp {
     Register(EventRegistrationData),
     Unregister(EventRegistrationData),
-    Update(EventRegistrationData)
+    Update(EventRegistrationData),
 }
 
 pub enum Error {
@@ -145,49 +142,57 @@ impl EventHandlerData {
     }
 }
 
-struct RegistrationBuilder {
+struct PollableOpBuilder {
     fd: Pollable,
     event_mask: EventType,
 }
 
-impl RegistrationBuilder {
-    fn new(fd: Pollable) -> RegistrationBuilder {
-        RegistrationBuilder {
+impl PollableOpBuilder {
+    fn new(fd: Pollable) -> PollableOpBuilder {
+        PollableOpBuilder {
             fd: fd,
             event_mask: EventType::NONE,
         }
     }
 
-    pub fn readable<'a>(&'a mut self) -> &'a mut RegistrationBuilder {
+    pub fn readable<'a>(&'a mut self) -> &'a mut PollableOpBuilder {
         self.event_mask |= EventType::READ;
         self
     }
 
-    pub fn writeable<'a>(&'a mut self) -> &'a mut RegistrationBuilder {
+    pub fn writeable<'a>(&'a mut self) -> &'a mut PollableOpBuilder {
         self.event_mask |= EventType::WRITE;
         self
     }
 
-    pub fn closeable<'a>(&'a mut self) -> &'a mut RegistrationBuilder {
+    pub fn closeable<'a>(&'a mut self) -> &'a mut PollableOpBuilder {
         self.event_mask |= EventType::CLOSE;
         self
     }
 
-    pub fn finish(&self) -> EventRegistrationData {
-        (self.fd.clone(), self.event_mask)
+    pub fn register(&self) -> PollableOp {
+        PollableOp::Register((self.fd.clone(), self.event_mask))
+    }
+
+    pub fn unregister(&self) -> PollableOp {
+        PollableOp::Unregister((self.fd.clone(), self.event_mask))
+    }
+
+    pub fn update(&self) -> PollableOp {
+        PollableOp::Update((self.fd.clone(), self.event_mask))
     }
 }
 
 pub trait EventHandler {
-    fn handle_read(&mut self, source: Pollable) -> Option<Vec<PollableOp>> {
+    fn handle_read(&mut self, _source: Pollable) -> Option<Vec<PollableOp>> {
         None
     }
 
-    fn handle_write(&mut self, source: Pollable) -> Option<Vec<PollableOp>> {
+    fn handle_write(&mut self, _source: Pollable) -> Option<Vec<PollableOp>> {
         None
     }
 
-    fn handle_close(&mut self, source: Pollable) -> Option<Vec<PollableOp>> {
+    fn handle_close(&mut self, _source: Pollable) -> Option<Vec<PollableOp>> {
         None
     }
 
@@ -214,7 +219,7 @@ impl HandlerMap {
         self.handlers.remove(id)
     }
 
-    // Returns a copy insrtead of ref 
+    // Returns a copy insrtead of ref
     pub fn get(&mut self, id: &i32) -> Option<EventHandlerData> {
         match self.handlers.get(id) {
             Some(handler) => Some(EventHandlerData::new(
@@ -229,7 +234,7 @@ impl HandlerMap {
 impl Deref for HandlerMap {
     type Target = HashMap<i32, EventHandlerData>;
     fn deref(&self) -> &Self::Target {
-       &self.handlers
+        &self.handlers
     }
 }
 
@@ -240,13 +245,13 @@ pub struct EventManager {
 }
 
 impl EventManager {
-    pub fn new() -> Result<SharedEventManager> {
+    pub fn new() -> Result<EventManager> {
         let epoll_fd = OwnedFD::from_unowned(epoll::create(true).map_err(|_| Error::EpollCreate)?);
-        Ok(Rc::new(RefCell::new(EventManager {
+        Ok(EventManager {
             fd: epoll_fd,
             handlers: HandlerMap::new(),
             events: vec![epoll::Event::new(epoll::Events::empty(), 0); EVENT_BUFFER_SIZE],
-        })))
+        })
     }
 
     fn event_type_to_epoll_mask(event_types: EventType) -> epoll::Events {
@@ -267,7 +272,11 @@ impl EventManager {
         epoll_event_mask
     }
 
-    fn run_pollable_ops(&mut self, wrapped_handler: Weak<RefCell<dyn EventHandler>>, pollable_ops: Vec<PollableOp>) -> Result<()> {
+    fn run_pollable_ops(
+        &mut self,
+        wrapped_handler: Weak<RefCell<dyn EventHandler>>,
+        pollable_ops: Vec<PollableOp>,
+    ) -> Result<()> {
         for op in pollable_ops {
             match op {
                 PollableOp::Register(data) => {
@@ -296,31 +305,31 @@ impl EventManager {
                     );
 
                     self.handlers.insert(**pollable.clone(), event_handler_data);
-                },
+                }
                 PollableOp::Unregister(data) => {
                     println!("Handling a Unregister op");
                     self.unregister(data.0)?;
                 }
-                _ => ()
+                _ => (),
             }
         }
         Ok(())
     }
 
-    pub fn register<T: EventHandler + 'static>(&mut self, handler: T) -> Result<Rc<RefCell<T>>> {        
+    pub fn register<T: EventHandler + 'static>(&mut self, handler: T) -> Result<Rc<RefCell<T>>> {
         let pollable_ops = handler.init();
         let wrapped_type = Rc::new(RefCell::new(handler));
         let wrapped_handler: Rc<RefCell<dyn EventHandler>> = wrapped_type.clone();
-        
+
         if let Some(ops) = pollable_ops {
-            self.run_pollable_ops(Rc::downgrade(&wrapped_handler), ops);
+            self.run_pollable_ops(Rc::downgrade(&wrapped_handler), ops)?;
         }
 
         Ok(wrapped_type)
     }
 
     pub fn update(&mut self, pollable: Pollable, event_types: EventType) -> Result<()> {
-        if let Some(event_handler_data) = self.handlers.get(&**pollable) {
+        if let Some(_) = self.handlers.get(&**pollable) {
             epoll::ctl(
                 self.fd.as_raw_fd(),
                 epoll::ControlOptions::EPOLL_CTL_MOD,
@@ -341,14 +350,14 @@ impl EventManager {
 
     pub fn unregister(&mut self, pollable: Pollable) -> Result<()> {
         match self.handlers.remove(&pollable) {
-            Some(event_handler_data) => {
+            Some(_) => {
                 epoll::ctl(
                     self.fd.as_raw_fd(),
                     epoll::ControlOptions::EPOLL_CTL_DEL,
                     pollable.as_raw_fd(),
                     epoll::Event::new(epoll::Events::empty(), 0),
                 )
-                .map_err(|_| Error::Poll);
+                .map_err(|_| Error::Poll)?;
             }
             None => {
                 println!("Pollable id {} not found", pollable);
@@ -363,28 +372,30 @@ impl EventManager {
         source: Pollable,
         evset: epoll::Events,
         mut handler: RefMut<'_, dyn EventHandler>,
-        wrapped_handler: Weak<RefCell<dyn EventHandler>>
-    ) {
+        wrapped_handler: Weak<RefCell<dyn EventHandler>>,
+    ) -> Result<()> {
         if evset.contains(epoll::Events::EPOLLIN) {
             if let Some(ops) = handler.handle_read(source.clone()) {
-                self.run_pollable_ops(wrapped_handler.clone(), ops);
+                self.run_pollable_ops(wrapped_handler.clone(), ops)?;
             }
         }
 
         if evset.contains(epoll::Events::EPOLLOUT) {
             if let Some(ops) = handler.handle_write(source.clone()) {
-                self.run_pollable_ops(wrapped_handler.clone(), ops);
+                self.run_pollable_ops(wrapped_handler.clone(), ops)?;
             }
         }
 
         if evset.contains(epoll::Events::EPOLLRDHUP) {
             if let Some(ops) = handler.handle_close(source.clone()) {
-                self.run_pollable_ops(wrapped_handler.clone(), ops);
+                self.run_pollable_ops(wrapped_handler.clone(), ops)?;
             }
         }
+        
+        Ok(())
     }
 
-    fn process_events(&mut self, event_count: usize) {
+    fn process_events(&mut self, event_count: usize) -> Result<()> {
         for idx in 0..event_count {
             let event = self.events[idx];
             let event_mask = event.events;
@@ -407,7 +418,7 @@ impl EventManager {
                                 evset,
                                 handler_ref,
                                 event_handler_data.handler,
-                            );
+                            )?;
                         }
                         Err(e) => {
                             println!("Failed to borrow mutable handler: {}", e);
@@ -423,12 +434,13 @@ impl EventManager {
                 self.unregister(handler);
             }
         }
+        Ok(())
     }
 
     pub fn run(&mut self) -> Result<usize> {
         let event_count =
             epoll::wait(self.fd.as_raw_fd(), -1, &mut self.events[..]).map_err(|_| Error::Poll)?;
-        self.process_events(event_count);
+        self.process_events(event_count)?;
 
         Ok(event_count)
     }
@@ -436,7 +448,7 @@ impl EventManager {
     pub fn run_timed(&mut self, milliseconds: i32) -> Result<usize> {
         let event_count = epoll::wait(self.fd.as_raw_fd(), milliseconds, &mut self.events[..])
             .map_err(|_| Error::Poll)?;
-        self.process_events(event_count);
+        self.process_events(event_count)?;
 
         Ok(event_count)
     }
@@ -463,27 +475,16 @@ impl EventHandler for ChatServer {
     fn init(&self) -> Option<Vec<PollableOp>> {
         let mut info = Vec::new();
 
-        // info = self
-        //     .clients
-        //     .iter()
-        //     .map(|client| {
-        //         RegistrationBuilder::new(OwnedFD::from_unowned(client.as_raw_fd()))
-        //             .readable()
-        //             .closeable()
-        //             .finish()
-        //     })
-        //     .collect();
-
         info.push(
-            PollableOp::Register(RegistrationBuilder::new(OwnedFD::from_unowned(self.listener.as_raw_fd()))
+            PollableOpBuilder::new(OwnedFD::from_unowned(self.listener.as_raw_fd()))
                 .readable()
-                .finish(),
-        ));
-        
+                .register(),
+        );
+
         Some(info)
     }
 
-    fn handle_read(&mut self, source: Pollable) -> Option<Vec<PollableOp>>  {
+    fn handle_read(&mut self, source: Pollable) -> Option<Vec<PollableOp>> {
         if **source == self.listener.as_raw_fd() {
             match self.listener.accept() {
                 Ok((stream, addr)) => {
@@ -491,11 +492,12 @@ impl EventHandler for ChatServer {
                     self.clients.push(stream);
                     println!("New client connected: {:?}", addr);
 
-                    return Some(vec![PollableOp::Register(RegistrationBuilder::new(new_pollable)
+                    return Some(vec![
+                        PollableOpBuilder::new(new_pollable)
                             .readable()
                             .closeable()
-                            .finish(),
-                    )]);
+                            .register(),
+                    ]);
                 }
                 Err(e) => {
                     println!("couldn't get client: {:?}", e);
@@ -508,30 +510,34 @@ impl EventHandler for ChatServer {
                 .position(|pollable| pollable.as_raw_fd() == source.as_raw_fd())
             {
                 let mut read_buf: Vec<u8> = vec![0; 128];
-                self.clients[index].read(read_buf.as_mut());
+                if self.clients[index].read(read_buf.as_mut()).unwrap() > 0 {
+                    let src_addr = self.clients[index].peer_addr().unwrap();
+                    let message = format!(
+                        "{} said {}",
+                        src_addr,
+                        String::from_utf8_lossy(read_buf.as_slice())
+                    );
 
-                let src_addr = self.clients[index].peer_addr().unwrap();
-                let message = format!("{} said {}", src_addr, String::from_utf8_lossy(read_buf.as_slice()));
-                
-                for mut client in &self.clients {
-                    client.write(message.as_bytes());
+                    for mut client in &self.clients {
+                        client.write(message.as_bytes());
+                    }
                 }
-
-                //self.clients[index].write(&read_buf);
             }
         }
         None
     }
 
     fn handle_close(&mut self, source: Pollable) -> Option<Vec<PollableOp>> {
-        if let Some(index) = self
-                .clients
-                .iter()
-                .position(|pollable| pollable.as_raw_fd() == source.as_raw_fd())
+        if let Some(_) = self
+            .clients
+            .iter()
+            .position(|pollable| pollable.as_raw_fd() == source.as_raw_fd())
         {
-            return Some(vec![PollableOp::Unregister(RegistrationBuilder::new(source).finish())]);
-        }   
-        None 
+            return Some(vec![
+                PollableOpBuilder::new(source).unregister(),
+            ]);
+        }
+        None
     }
 }
 
@@ -597,7 +603,7 @@ impl EventHandler for ChatServer {
 //     fn registration_info(&self) -> Vec<EventRegistrationData> {
 //         let mut info = Vec::new();
 //         for (i, fd) in self.fds.iter().enumerate() {
-//             info.push(RegistrationBuilder::new(fd.clone())
+//             info.push(PollableOpBuilder::new(fd.clone())
 //             .readable()
 //             .finish())
 //         }
@@ -615,14 +621,14 @@ fn main() {
         .unwrap();
 
     println!("Running ePolly with TCP server on port {}...", port);
-    let mut wrapped_em = EventManager::new().unwrap();
+    let mut em = EventManager::new().unwrap();
     let server = ChatServer::new(port);
-    let wrapped_server = wrapped_em.borrow_mut().register(server).unwrap();
+    let wrapped_server = em.register(server).unwrap();
 
     loop {
         let server = wrapped_server.borrow();
         //server.stats();
         drop(server);
-        wrapped_em.borrow_mut().run_timed(1000).unwrap();
+        em.run_timed(1000).unwrap();
     }
 }
