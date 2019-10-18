@@ -13,6 +13,12 @@ use std::io;
 
 #[derive(Default, Clone, PartialEq)]
 pub struct OwnedFD {
+    // This is the owned fd.
+    // EventManager will use this with epoll.
+    _fd: RawFd,
+    // This is the copy.
+    // Event manager will use this in callbacks so the EventHandler implementation can
+    // multiplex the handling for multiple registered fds.
     fd: RawFd,
 }
 
@@ -20,20 +26,24 @@ impl OwnedFD {
     fn dup(fd: RawFd) -> Result<RawFd, io::Error> {
         unsafe { 
             match libc::dup(fd) {
-                fd if fd < 0 => Err(io::Error::last_os_error()),
-                _ => Ok(fd)
+                new_fd if new_fd < 0 => Err(io::Error::last_os_error()),
+                new_fd => Ok(new_fd)
             }
         }
     }
 
     pub fn from_unowned(rawfd: RawFd) -> Result<Pollable, io::Error> {
-        Ok(Rc::new(OwnedFD { fd: OwnedFD::dup(rawfd)? }))
+        Ok(Rc::new(OwnedFD { _fd: rawfd, fd: rawfd }))
     }
 
     pub fn from<T: AsRawFd>(rawfd: &T) -> Result<Pollable, io::Error> {
         Ok(Rc::new(OwnedFD {
-            fd: OwnedFD::dup(rawfd.as_raw_fd())?,
+            _fd: OwnedFD::dup(rawfd.as_raw_fd())?, fd: rawfd.as_raw_fd(),
         }))
+    }
+
+    pub fn dup_fd(&self) -> RawFd {
+        self._fd
     }
 }
 
@@ -45,8 +55,7 @@ impl AsRawFd for OwnedFD {
 
 impl Drop for OwnedFD {
     fn drop(&mut self) {
-        println!("Closing fd {}", self.fd);
-        unsafe { libc::close(self.fd) };
+        unsafe { libc::close(self._fd) };
     }
 }
 
