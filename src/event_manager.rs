@@ -178,7 +178,7 @@ impl EventManager {
             epoll::Event::new(
                 EventManager::event_type_to_epoll_mask(event_type),
                 // Use the original fd for event source identification.
-                **pollable as u64,
+                pollable.as_raw_fd() as u64,
             ),
         )
         .map_err(|_| Error::Poll(io::Error::last_os_error()))?;
@@ -186,7 +186,7 @@ impl EventManager {
         let event_handler_data =
             EventHandlerData::new((pollable.clone(), event_type), wrapped_handler.clone());
 
-        self.handlers.insert(**pollable.clone(), event_handler_data);
+        self.handlers.insert(pollable.as_raw_fd(), event_handler_data);
         Ok(())
     }
 
@@ -230,14 +230,14 @@ impl EventManager {
     }
 
     fn update_event(&mut self, event: EventRegistrationData) -> Result<()> {
-        if let Some(_) = self.handlers.get(&**event.0) {
+        if let Some(_) = self.handlers.get(&event.0.as_raw_fd()) {
             epoll::ctl(
                 self.fd.as_raw_fd(),
                 epoll::ControlOptions::EPOLL_CTL_MOD,
                 event.0.dup_fd(),
                 epoll::Event::new(
                     EventManager::event_type_to_epoll_mask(event.1),
-                    **event.0 as u64,
+                    event.0.as_raw_fd() as u64,
                 ),
             )
             .map_err(|_| Error::Poll(io::Error::last_os_error()))?;
