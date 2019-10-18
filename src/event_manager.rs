@@ -6,14 +6,16 @@
 // found in the THIRD-PARTY file.
 
 use epoll::Events;
+use pollable::{
+    EventRegistrationData, EventType, OwnedFD, Pollable, PollableOp, PollableOpBuilder,
+};
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::fmt::Formatter;
-use std::os::unix::io::{AsRawFd};
-use std::rc::{Rc, Weak};
-use std::ops::Deref;
-use pollable::{ Pollable, PollableOp, OwnedFD, EventRegistrationData, EventType, PollableOpBuilder };
 use std::io;
+use std::ops::Deref;
+use std::os::unix::io::AsRawFd;
+use std::rc::{Rc, Weak};
 
 const EVENT_BUFFER_SIZE: usize = 100;
 const DEFAULT_EPOLL_TIMEOUT: i32 = 250;
@@ -33,7 +35,7 @@ impl std::fmt::Debug for Error {
 
         match self {
             EpollCreate => write!(f, "Unable to create epoll fd."),
-            Poll(err) => write!(f, "Error during epoll call: {}",err),
+            Poll(err) => write!(f, "Error during epoll call: {}", err),
             AlreadyExists => write!(f, "A handler for the specified pollable already exists"),
             PollableNotFound(pollable) => write!(
                 f,
@@ -128,7 +130,9 @@ pub struct EventManager {
 
 impl EventManager {
     pub fn new() -> Result<EventManager> {
-        let epoll_fd = OwnedFD::from_unowned(epoll::create(true).map_err(|_| Error::EpollCreate)?).map_err(|_| Error::EpollCreate).unwrap();
+        let epoll_fd = OwnedFD::from_unowned(epoll::create(true).map_err(|_| Error::EpollCreate)?)
+            .map_err(|_| Error::EpollCreate)
+            .unwrap();
         Ok(EventManager {
             fd: epoll_fd,
             handlers: HandlerMap::new(),
@@ -154,7 +158,11 @@ impl EventManager {
         epoll_event_mask
     }
 
-    fn register_handler(&mut self, event_data: EventRegistrationData, wrapped_handler: Weak<RefCell<dyn EventHandler>>) -> Result<()> {
+    fn register_handler(
+        &mut self,
+        event_data: EventRegistrationData,
+        wrapped_handler: Weak<RefCell<dyn EventHandler>>,
+    ) -> Result<()> {
         let (pollable, event_type) = event_data;
 
         if let Some(_) = self.handlers.get(&pollable.clone()) {
@@ -175,10 +183,8 @@ impl EventManager {
         )
         .map_err(|_| Error::Poll(io::Error::last_os_error()))?;
 
-        let event_handler_data = EventHandlerData::new(
-            (pollable.clone(), event_type),
-            wrapped_handler.clone(),
-        );
+        let event_handler_data =
+            EventHandlerData::new((pollable.clone(), event_type), wrapped_handler.clone());
 
         self.handlers.insert(**pollable.clone(), event_handler_data);
         Ok(())
@@ -200,7 +206,9 @@ impl EventManager {
     ) -> Result<()> {
         for op in pollable_ops {
             match op {
-                PollableOp::Register(data) => self.register_handler(data, wrapped_handler.clone())?,
+                PollableOp::Register(data) => {
+                    self.register_handler(data, wrapped_handler.clone())?
+                }
                 PollableOp::Unregister(data) => self.unregister(data.0)?,
                 PollableOp::Update(data) => self.update_event(data)?,
             }
@@ -268,7 +276,7 @@ impl EventManager {
         wrapped_handler: Weak<RefCell<dyn EventHandler>>,
     ) -> Result<()> {
         let mut all_ops = Vec::new();
-        
+
         // If an error occurs on a fd then only dispatch the error callback,
         // ignoring other flags.
         if evset.contains(epoll::Events::EPOLLERR) {
@@ -341,14 +349,14 @@ impl EventManager {
 
     // Wait for events, then dispatch to registered event handlers.
     pub fn run(&mut self) -> Result<usize> {
-        let event_count =
-            epoll::wait(self.fd.as_raw_fd(), -1, &mut self.events[..]).map_err(|_| Error::Poll(io::Error::last_os_error()))?;
+        let event_count = epoll::wait(self.fd.as_raw_fd(), -1, &mut self.events[..])
+            .map_err(|_| Error::Poll(io::Error::last_os_error()))?;
         self.process_events(event_count)?;
 
         Ok(event_count)
     }
 
-    // Wait for events or a timeout, then dispatch to registered event handlers. 
+    // Wait for events or a timeout, then dispatch to registered event handlers.
     pub fn run_timeout(&mut self, milliseconds: i32) -> Result<usize> {
         let event_count = epoll::wait(self.fd.as_raw_fd(), milliseconds, &mut self.events[..])
             .map_err(|_| Error::Poll(io::Error::last_os_error()))?;
@@ -368,8 +376,10 @@ impl EventHandler for EventManager {
     }
 
     fn init(&self) -> Option<Vec<PollableOp>> {
-       Some(vec![PollableOpBuilder::new(OwnedFD::from(&*self.fd).unwrap())
-            .readable()
-            .register()])
+        Some(vec![PollableOpBuilder::new(
+            OwnedFD::from(&*self.fd).unwrap(),
+        )
+        .readable()
+        .register()])
     }
 }

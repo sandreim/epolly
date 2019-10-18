@@ -3,19 +3,19 @@ extern crate libc;
 #[macro_use]
 extern crate bitflags;
 
-use std::net::{TcpListener, TcpStream, SocketAddr};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 
 mod event_manager;
 mod pollable;
 
-use std::os::unix::io::{AsRawFd, RawFd};
-use pollable::*;
 use event_manager::*;
-use std::ffi::OsString;
+use pollable::*;
 use std::env;
-use std::io::{Read, Write};
-use std::ops::{ Deref, DerefMut };
+use std::ffi::OsString;
 use std::fmt;
+use std::io::{Read, Write};
+use std::ops::{Deref, DerefMut};
+use std::os::unix::io::{AsRawFd, RawFd};
 
 pub struct ChatClient {
     stream: TcpStream,
@@ -23,7 +23,7 @@ pub struct ChatClient {
 }
 
 impl ChatClient {
-    pub fn new(stream: TcpStream, addr: SocketAddr) -> ChatClient{
+    pub fn new(stream: TcpStream, addr: SocketAddr) -> ChatClient {
         ChatClient {
             stream: stream,
             addr: addr,
@@ -102,7 +102,7 @@ impl EventHandler for ChatServer {
                     println!("Client connected {}", &client);
                     match client.greet() {
                         Ok(count) => self.tx += count as u64,
-                        Err(err) => println!("Error writing to client socket {}", err)
+                        Err(err) => println!("Error writing to client socket {}", err),
                     }
                     self.clients.push(client);
 
@@ -157,14 +157,18 @@ impl EventHandler for ChatServer {
         None
     }
 
-    fn handle_error(&mut self, source: Pollable) -> Option<Vec<PollableOp>>  {
+    fn handle_error(&mut self, source: Pollable) -> Option<Vec<PollableOp>> {
         if let Some(index) = self
             .clients
             .iter()
             .position(|client| client.as_raw_fd() == source.as_raw_fd())
         {
             let client = self.clients.remove(index);
-            println!("Closing connection for client {} : {}", source, client.take_error().unwrap().unwrap());
+            println!(
+                "Closing connection for client {} : {}",
+                source,
+                client.take_error().unwrap().unwrap()
+            );
             return Some(vec![PollableOpBuilder::new(source).unregister()]);
         }
         None
@@ -193,8 +197,8 @@ fn main() {
         server.stats();
         drop(server);
         match em.run_timeout(1000) {
-            Ok(_count) => {},
-            Err(err) => println!("Error: {:?}", err)
+            Ok(_count) => {}
+            Err(err) => println!("Error: {:?}", err),
         }
     }
 }

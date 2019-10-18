@@ -6,10 +6,10 @@
 // found in the THIRD-PARTY file.
 
 use std::fmt::Formatter;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::rc::{Rc};
-use std::ops::Deref;
 use std::io;
+use std::ops::Deref;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::rc::Rc;
 
 #[derive(Default, Clone, PartialEq)]
 pub struct OwnedFD {
@@ -24,21 +24,25 @@ pub struct OwnedFD {
 
 impl OwnedFD {
     fn dup(fd: RawFd) -> Result<RawFd, io::Error> {
-        unsafe { 
+        unsafe {
             match libc::dup(fd) {
                 new_fd if new_fd < 0 => Err(io::Error::last_os_error()),
-                new_fd => Ok(new_fd)
+                new_fd => Ok(new_fd),
             }
         }
     }
 
     pub fn from_unowned(rawfd: RawFd) -> Result<Pollable, io::Error> {
-        Ok(Rc::new(OwnedFD { _fd: rawfd, fd: rawfd }))
+        Ok(Rc::new(OwnedFD {
+            _fd: rawfd,
+            fd: rawfd,
+        }))
     }
 
     pub fn from<T: AsRawFd>(rawfd: &T) -> Result<Pollable, io::Error> {
         Ok(Rc::new(OwnedFD {
-            _fd: OwnedFD::dup(rawfd.as_raw_fd())?, fd: rawfd.as_raw_fd(),
+            _fd: OwnedFD::dup(rawfd.as_raw_fd())?,
+            fd: rawfd.as_raw_fd(),
         }))
     }
 
