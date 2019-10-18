@@ -74,6 +74,10 @@ pub trait EventHandler {
         None
     }
 
+    fn handle_error(&mut self, _source: Pollable) -> Option<Vec<PollableOp>> {
+        None
+    }
+
     /// Initial registration of pollable objects.
     fn init(&self) -> Option<Vec<PollableOp>>;
 }
@@ -246,7 +250,7 @@ impl EventManager {
                     pollable.dup_fd(),
                     epoll::Event::new(epoll::Events::empty(), 0),
                 )
-                .map_err(|_| Error::Poll)?;
+                .map_err(|_| Error::Poll(io::Error::last_os_error()))?;
             }
             None => {
                 println!("Pollable id {} not found", pollable);
@@ -264,25 +268,31 @@ impl EventManager {
         wrapped_handler: Weak<RefCell<dyn EventHandler>>,
     ) -> Result<()> {
         let mut all_ops = Vec::new();
-
-        if evset.contains(epoll::Events::EPOLLIN) {
-            if let Some(mut ops) = handler.handle_read(source.clone()) {
-                all_ops.append(&mut ops);
-            }
-        }
-
-        if evset.contains(epoll::Events::EPOLLOUT) {
-            if let Some(mut ops) = handler.handle_write(source.clone()) {
-                all_ops.append(&mut ops);
-            }
-        }
-
-        if evset.contains(epoll::Events::EPOLLRDHUP) {
-            if let Some(mut ops) = handler.handle_close(source.clone()) {
-                all_ops.append(&mut ops);
-            }
-        }
         
+        // If an error occurs on a fd then only dispatch the error callback,
+        // ignoring other flags.
+        if evset.contains(epoll::Events::EPOLLERR) {
+            if let Some(mut ops) = handler.handle_error(source.clone()) {
+                all_ops.append(&mut ops);
+            }
+        } else {
+            if evset.contains(epoll::Events::EPOLLIN) {
+                if let Some(mut ops) = handler.handle_read(source.clone()) {
+                    all_ops.append(&mut ops);
+                }
+            }
+            if evset.contains(epoll::Events::EPOLLOUT) {
+                if let Some(mut ops) = handler.handle_write(source.clone()) {
+                    all_ops.append(&mut ops);
+                }
+            }
+            if evset.contains(epoll::Events::EPOLLRDHUP) {
+                if let Some(mut ops) = handler.handle_close(source.clone()) {
+                    all_ops.append(&mut ops);
+                }
+            }
+        }
+
         self.run_pollable_ops(wrapped_handler.clone(), all_ops)?;
         Ok(())
     }

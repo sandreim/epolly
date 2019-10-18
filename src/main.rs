@@ -99,9 +99,9 @@ impl EventHandler for ChatServer {
                 Ok((stream, addr)) => {
                     let new_pollable = OwnedFD::from(&stream).unwrap();
                     let mut client = ChatClient::new(stream, addr);
-                    println!("New client connected: fd = {}", &client);
+                    println!("Client connected {}", &client);
                     match client.greet() {
-                        Ok(count) => self.rx += count as u64,
+                        Ok(count) => self.tx += count as u64,
                         Err(err) => println!("Error writing to client socket {}", err)
                     }
                     self.clients.push(client);
@@ -146,13 +146,25 @@ impl EventHandler for ChatServer {
     }
 
     fn handle_close(&mut self, source: Pollable) -> Option<Vec<PollableOp>> {
-        println!("Close!");
         if let Some(index) = self
             .clients
             .iter()
-            .position(|pollable| pollable.as_raw_fd() == source.as_raw_fd())
+            .position(|client| client.as_raw_fd() == source.as_raw_fd())
         {
-            self.clients.remove(index);
+            println!("Client {} closed connection.", self.clients.remove(index));
+            return Some(vec![PollableOpBuilder::new(source).unregister()]);
+        }
+        None
+    }
+
+    fn handle_error(&mut self, source: Pollable) -> Option<Vec<PollableOp>>  {
+        if let Some(index) = self
+            .clients
+            .iter()
+            .position(|client| client.as_raw_fd() == source.as_raw_fd())
+        {
+            let client = self.clients.remove(index);
+            println!("Closing connection for client {} : {}", source, client.take_error().unwrap().unwrap());
             return Some(vec![PollableOpBuilder::new(source).unregister()]);
         }
         None
