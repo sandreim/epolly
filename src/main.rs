@@ -3,7 +3,7 @@ extern crate libc;
 #[macro_use]
 extern crate bitflags;
 
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, SocketAddr};
 
 mod event_manager;
 mod pollable;
@@ -14,9 +14,49 @@ use event_manager::*;
 use std::ffi::OsString;
 use std::env;
 use std::io::{Read, Write};
+use std::ops::{ Deref, DerefMut };
+use std::fmt;
+
+pub struct ChatClient {
+    stream: TcpStream,
+    addr: SocketAddr,
+}
+
+impl ChatClient {
+    pub fn new(stream: TcpStream, addr: SocketAddr) -> ChatClient{
+        ChatClient {
+            stream: stream,
+            addr: addr,
+        }
+    }
+
+    pub fn greet(&mut self) -> std::io::Result<usize> {
+        let message = format!("Welcome {} to the example Polly chatserver\r\n", &self);
+        self.stream.write(message.as_bytes())
+    }
+}
+
+impl fmt::Display for ChatClient {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self.addr)
+    }
+}
+
+impl Deref for ChatClient {
+    type Target = TcpStream;
+    fn deref(&self) -> &Self::Target {
+        &self.stream
+    }
+}
+
+impl DerefMut for ChatClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream
+    }
+}
 
 pub struct ChatServer {
-    clients: Vec<TcpStream>,
+    clients: Vec<ChatClient>,
     listener: TcpListener,
     rx: u64,
     tx: u64,
@@ -54,13 +94,17 @@ impl EventHandler for ChatServer {
     }
 
     fn handle_read(&mut self, source: Pollable) -> Option<Vec<PollableOp>> {
-        if **source == self.listener.as_raw_fd() {
+        if source.as_raw_fd() == self.listener.as_raw_fd() {
             match self.listener.accept() {
                 Ok((stream, addr)) => {
                     let new_pollable = OwnedFD::from(&stream).unwrap();
-                    self.clients.push(stream);
-
-                    println!("New client connected: {:?}", addr);
+                    let mut client = ChatClient::new(stream, addr);
+                    println!("New client connected: fd = {}", &client);
+                    match client.greet() {
+                        Ok(count) => self.rx += count as u64,
+                        Err(err) => println!("Error writing to client socket {}", err)
+                    }
+                    self.clients.push(client);
 
                     return Some(vec![PollableOpBuilder::new(new_pollable)
                         .readable()
@@ -84,15 +128,14 @@ impl EventHandler for ChatServer {
                         return None;
                     }
 
-                    let src_addr = self.clients[index].peer_addr().unwrap();
                     self.rx += count as u64;
                     let message = format!(
                         "{} said {}",
-                        src_addr,
+                        self.clients[index],
                         String::from_utf8_lossy(&read_buf.as_slice()[0..count])
                     );
 
-                    for mut client in &self.clients {
+                    for client in self.clients.iter_mut() {
                         client.write(message.as_bytes());
                         self.tx += message.len() as u64;
                     }
@@ -103,86 +146,18 @@ impl EventHandler for ChatServer {
     }
 
     fn handle_close(&mut self, source: Pollable) -> Option<Vec<PollableOp>> {
-        if let Some(_) = self
+        println!("Close!");
+        if let Some(index) = self
             .clients
             .iter()
             .position(|pollable| pollable.as_raw_fd() == source.as_raw_fd())
         {
+            self.clients.remove(index);
             return Some(vec![PollableOpBuilder::new(source).unregister()]);
         }
         None
     }
 }
-
-// struct UdpEchoServer {
-//     sockets: Vec<UdpSocket>,
-//     fds: Vec<Pollable>,
-//     read_buf: Vec<u8>,
-//     total_rx: usize,
-//     total_tx: usize,
-// }
-
-// impl UdpEchoServer {
-//     fn new(port: u16) -> std::io::Result<UdpEchoServer> {
-//         let mut sockets = Vec::new();
-//         let mut fds = Vec::new();
-
-//         let mut socket = UdpSocket::bind(format!("127.0.0.1:{}", port))?;
-//         fds.push(OwnedFD::from_unowned(socket.as_raw_fd()));
-//         sockets.push(socket);
-//         socket = UdpSocket::bind(format!("127.0.0.1:{}", port + 1))?;
-//         fds.push(OwnedFD::from_unowned(socket.as_raw_fd()));
-//         sockets.push(socket);
-
-//         Ok(UdpEchoServer {
-//             sockets: sockets,
-//             fds: fds,
-//             read_buf: vec![0; 128],
-//             total_rx: 0,
-//             total_tx: 0,
-//         })
-//     }
-
-//     pub fn stats(&self) {
-//         println!("Rx bytes: {}, Tx bytes: {}", self.total_rx, self.total_tx);
-//     }
-// }
-
-// impl EventHandler for UdpEchoServer {
-//     fn handle_read(&mut self, source: Pollable) {
-//         let mut socket_iter = self.fds.iter();
-
-//         match socket_iter.position(|pollable| pollable.as_raw_fd() == source.as_raw_fd()) {
-//             Some(index) => {
-//                 match self.sockets[index].recv_from(self.read_buf.as_mut()) {
-//                     Ok((count, from)) => {
-//                         self.total_rx += count;
-//                         println!("event_info: {}, - received {} from {}", *source, count, from);
-//                         match self.sockets[index].send_to(&self.read_buf[..count], from) {
-//                                 Ok(tx) => self.total_tx += tx,
-//                                 Err(e) => println!("Error while doing TX: {}", e)
-//                         }
-//                     },
-//                     Err(e) => println!("Error while doing RX: {}", e)
-//                 }
-//             },
-//             None => println!("Unable to find pollable")
-//         }
-//     }
-//     fn handle_write(&mut self, _source: Pollable) {
-//         println!("Writeable")
-//     }
-
-//     fn registration_info(&self) -> Vec<EventRegistrationData> {
-//         let mut info = Vec::new();
-//         for (i, fd) in self.fds.iter().enumerate() {
-//             info.push(PollableOpBuilder::new(fd.clone())
-//             .readable()
-//             .finish())
-//         }
-//         info
-//     }
-// }
 
 fn main() {
     let port = env::args_os()
@@ -205,6 +180,9 @@ fn main() {
         let server = wrapped_server.borrow();
         server.stats();
         drop(server);
-        em.run_timeout(1000).unwrap();
+        match em.run_timeout(1000) {
+            Ok(_count) => {},
+            Err(err) => println!("Error: {:?}", err)
+        }
     }
 }
