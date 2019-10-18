@@ -13,6 +13,7 @@ use std::os::unix::io::{AsRawFd};
 use std::rc::{Rc, Weak};
 use std::ops::Deref;
 use pollable::{ Pollable, PollableOp, OwnedFD, EventRegistrationData, EventType, PollableOpBuilder };
+use std::io;
 
 const EVENT_BUFFER_SIZE: usize = 100;
 const DEFAULT_EPOLL_TIMEOUT: i32 = 250;
@@ -21,7 +22,7 @@ type Result<T> = std::result::Result<T, Error>;
 
 pub enum Error {
     EpollCreate,
-    Poll,
+    Poll(io::Error),
     AlreadyExists,
     PollableNotFound(Pollable),
 }
@@ -32,7 +33,7 @@ impl std::fmt::Debug for Error {
 
         match self {
             EpollCreate => write!(f, "Unable to create epoll fd."),
-            Poll => write!(f, "Error during epoll call."),
+            Poll(err) => write!(f, "Error during epoll call: {}",err),
             AlreadyExists => write!(f, "A handler for the specified pollable already exists"),
             PollableNotFound(pollable) => write!(
                 f,
@@ -160,13 +161,15 @@ impl EventManager {
         epoll::ctl(
             self.fd.as_raw_fd(),
             epoll::ControlOptions::EPOLL_CTL_ADD,
-            pollable.as_raw_fd(),
+            // Use the duplicate fd for event polling.
+            pollable.dup_fd(),
             epoll::Event::new(
                 EventManager::event_type_to_epoll_mask(event_type),
+                // Use the original fd for event source identification.
                 **pollable as u64,
             ),
         )
-        .map_err(|_| Error::Poll)?;
+        .map_err(|_| Error::Poll(io::Error::last_os_error()))?;
 
         let event_handler_data = EventHandlerData::new(
             (pollable.clone(), event_type),
@@ -219,13 +222,13 @@ impl EventManager {
             epoll::ctl(
                 self.fd.as_raw_fd(),
                 epoll::ControlOptions::EPOLL_CTL_MOD,
-                event.0.as_raw_fd(),
+                event.0.dup_fd(),
                 epoll::Event::new(
                     EventManager::event_type_to_epoll_mask(event.1),
                     **event.0 as u64,
                 ),
             )
-            .map_err(|_| Error::Poll)?;
+            .map_err(|_| Error::Poll(io::Error::last_os_error()))?;
         } else {
             println!("Pollable ID {} not found", event.0);
             return Err(Error::PollableNotFound(event.0));
@@ -240,7 +243,7 @@ impl EventManager {
                 epoll::ctl(
                     self.fd.as_raw_fd(),
                     epoll::ControlOptions::EPOLL_CTL_DEL,
-                    pollable.as_raw_fd(),
+                    pollable.dup_fd(),
                     epoll::Event::new(epoll::Events::empty(), 0),
                 )
                 .map_err(|_| Error::Poll)?;
@@ -260,24 +263,27 @@ impl EventManager {
         mut handler: RefMut<'_, dyn EventHandler>,
         wrapped_handler: Weak<RefCell<dyn EventHandler>>,
     ) -> Result<()> {
+        let mut all_ops = Vec::new();
+
         if evset.contains(epoll::Events::EPOLLIN) {
-            if let Some(ops) = handler.handle_read(source.clone()) {
-                self.run_pollable_ops(wrapped_handler.clone(), ops)?;
+            if let Some(mut ops) = handler.handle_read(source.clone()) {
+                all_ops.append(&mut ops);
             }
         }
 
         if evset.contains(epoll::Events::EPOLLOUT) {
-            if let Some(ops) = handler.handle_write(source.clone()) {
-                self.run_pollable_ops(wrapped_handler.clone(), ops)?;
+            if let Some(mut ops) = handler.handle_write(source.clone()) {
+                all_ops.append(&mut ops);
             }
         }
 
         if evset.contains(epoll::Events::EPOLLRDHUP) {
-            if let Some(ops) = handler.handle_close(source.clone()) {
-                self.run_pollable_ops(wrapped_handler.clone(), ops)?;
+            if let Some(mut ops) = handler.handle_close(source.clone()) {
+                all_ops.append(&mut ops);
             }
         }
         
+        self.run_pollable_ops(wrapped_handler.clone(), all_ops)?;
         Ok(())
     }
 
@@ -326,7 +332,7 @@ impl EventManager {
     // Wait for events, then dispatch to registered event handlers.
     pub fn run(&mut self) -> Result<usize> {
         let event_count =
-            epoll::wait(self.fd.as_raw_fd(), -1, &mut self.events[..]).map_err(|_| Error::Poll)?;
+            epoll::wait(self.fd.as_raw_fd(), -1, &mut self.events[..]).map_err(|_| Error::Poll(io::Error::last_os_error()))?;
         self.process_events(event_count)?;
 
         Ok(event_count)
@@ -335,25 +341,20 @@ impl EventManager {
     // Wait for events or a timeout, then dispatch to registered event handlers. 
     pub fn run_timeout(&mut self, milliseconds: i32) -> Result<usize> {
         let event_count = epoll::wait(self.fd.as_raw_fd(), milliseconds, &mut self.events[..])
-            .map_err(|_| Error::Poll)?;
+            .map_err(|_| Error::Poll(io::Error::last_os_error()))?;
         self.process_events(event_count)?;
 
         Ok(event_count)
     }
 }
 
+// Cascaded epoll support.
 impl EventHandler for EventManager {
     fn handle_read(&mut self, _source: Pollable) -> Option<Vec<PollableOp>> {
-        self.run_timeout(DEFAULT_EPOLL_TIMEOUT);
-        None
-    }
-
-    fn handle_write(&mut self, _source: Pollable) -> Option<Vec<PollableOp>> {
-        None
-    }
-
-    fn handle_close(&mut self, _source: Pollable) -> Option<Vec<PollableOp>> {
-        None
+        match self.run_timeout(DEFAULT_EPOLL_TIMEOUT) {
+            Ok(_) => None,
+            Err(_) => None,
+        }
     }
 
     fn init(&self) -> Option<Vec<PollableOp>> {
